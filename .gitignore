@@ -1,0 +1,6 @@
+*.npz
+*.fits
+*.csv
+*.pdf
+__pycache__/
+*.log
