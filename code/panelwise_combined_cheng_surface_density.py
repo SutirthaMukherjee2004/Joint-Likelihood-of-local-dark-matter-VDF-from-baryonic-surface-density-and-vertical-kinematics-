@@ -29,6 +29,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
+from matplotlib.lines import Line2D
+from scipy.optimize import curve_fit
 import numpy as np
 import pandas as pd
 from astropy.coordinates import Galactocentric, SkyCoord
@@ -1616,7 +1618,6 @@ def plot_all_sigma_overplot(results: dict[str, dict[str, object]], outd: Path) -
         if z_values.size == 0:
             continue
         colors = cmap(np.linspace(0.08, 0.92, len(z_values)))
-        shm_label_added = False
         for z_value, color in zip(z_values, colors):
             if z_value > pp["zmax"] + 1e-9:
                 continue
@@ -1635,17 +1636,17 @@ def plot_all_sigma_overplot(results: dict[str, dict[str, object]], outd: Path) -
             shm = np.array([sdc.shm_sigma(float(r), [z_used])[0] for r in rr], dtype=float)
             ok_shm = np.isfinite(rr) & np.isfinite(shm)
             if np.any(ok_shm):
+                # SHM for this |Z| slice, drawn in the SAME colour as the slice
+                # (dotted, so it stays distinct from the measured Sigma line).
                 ax.plot(
                     rr[ok_shm],
                     shm[ok_shm],
-                    color="0.12",
+                    color=color,
                     ls=":",
-                    lw=1.25,
-                    alpha=0.72,
-                    label="SHM" if not shm_label_added else None,
-                    zorder=1,
+                    lw=1.7,
+                    alpha=0.95,
+                    zorder=2,
                 )
-                shm_label_added = True
             ax.errorbar(
                 sub["R_mid"],
                 sub["Sigma_median_Msun_pc2"],
@@ -1668,7 +1669,10 @@ def plot_all_sigma_overplot(results: dict[str, dict[str, object]], outd: Path) -
         secax = ax.secondary_yaxis("right", functions=(sdc.s2k, sdc.k2s))
         secax.set_ylabel(r"$|K_Z|$ [km$^2$ s$^{-2}$ kpc$^{-1}$]")
         ax.tick_params(direction="in", top=True, right=True)
-        ax.legend(frameon=False, ncol=3, fontsize=8)
+        handles, leg_labels = ax.get_legend_handles_labels()
+        handles.append(Line2D([0], [0], color="0.4", ls=":", lw=1.7))
+        leg_labels.append("SHM (dotted, same colour as its slice)")
+        ax.legend(handles, leg_labels, frameon=False, ncol=3, fontsize=8)
         ax.set_ylim(bottom=0)
     axes[-1].set_xlabel(r"$R$ [kpc]")
     fig.tight_layout()
@@ -2063,55 +2067,198 @@ def plot_fig5_hsigma_results(results: dict[str, dict[str, object]], outd: Path) 
     plt.close(fig)
 
 
+# --- Effect of the three Cheng sigma_z(|Z|) assumptions on Sigma(|Z|) --------
+# The vertical Jeans surface density depends on d(sigma_Z^2)/dz, so the assumed
+# sigma_Z(|Z|) functional form changes the inferred Sigma(|Z|). The Cheng paper
+# (App. A & B) uses: linear sigma_Z^2 = a|Z|+b (primary), quadratic
+# sigma_Z^2 = kZ^2 + sigma0^2, and tanh sigma_Z = kz*tanh(|Z|/L) + s0.
+SIGMAZ_MODELS = ("linear", "quadratic", "tanh")
+SIGMAZ_FX_STYLE = {"linear": ("-", "#1f77b4"), "quadratic": ("--", "#ff7f0e"), "tanh": (":", "#2ca02c")}
+SIGMAZ_POP_COLOR = {"thin": "#2166ac", "thick": "#b2182b", "halo": "#238b45"}
+
+
+def sigmaz_model_fits(profile: pd.DataFrame, pp: dict) -> dict[str, pd.DataFrame]:
+    """Per-R-bin Jeans fit tables under each sigma_Z(|Z|) model: {model: fits_df}."""
+    out: dict[str, pd.DataFrame] = {}
+    if profile is None or profile.empty or pp is None:
+        return out
+    for model in SIGMAZ_MODELS:
+        try:
+            fits, _ = sdc.fit_bins(
+                profile, zmx=float(pp["zmax"]), robust=True, clip=3.0,
+                sigz_model=model, pp=pp, rl0=0, rl1=25,
+            )
+            if fits is not None and not fits.empty:
+                out[model] = fits
+        except Exception:
+            continue
+    return out
+
+
+def _sigma_band(fits: pd.DataFrame, pp: dict, r_target: float, z: np.ndarray,
+                nmc: int = 200, rng=None) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+    """Sigma(z) median + 16-84% MC band at the fitted R bin nearest r_target.
+
+    sdc.mc_sig propagates the fit-parameter covariance of whichever sigma_Z model
+    the row carries (linear / quadratic / tanh) plus the tracer-scale and h_sigma
+    uncertainties, so every model gets its own error band.
+    """
+    if rng is None:
+        rng = np.random.default_rng(7)
+    row = fits.iloc[int((fits["rm"] - r_target).abs().values.argmin())]
+    med, lo, hi = sdc.mc_sig(row, pp, z, nmc=nmc, rng=rng)
+    return (float(row["rm"]), np.asarray(med, dtype=float),
+            np.asarray(lo, dtype=float), np.asarray(hi, dtype=float))
+
+
+def _surface_band(surface: pd.DataFrame, r_target: float):
+    """Measured (linear MC) 16-84% Sigma(|Z|) band at the R bin nearest r_target."""
+    if surface is None or surface.empty:
+        return None
+    rv = np.array(sorted(surface["R_mid"].dropna().unique()), dtype=float)
+    if rv.size == 0:
+        return None
+    ru = float(rv[np.argmin(np.abs(rv - r_target))])
+    sb = surface[
+        np.isclose(surface["R_mid"], ru)
+        & np.isfinite(surface["Sigma_p16_Msun_pc2"])
+        & np.isfinite(surface["Sigma_p84_Msun_pc2"])
+    ].sort_values("Z_abs")
+    return sb if not sb.empty else None
+
+
+def plot_population_sigmaz_model_effect(label: str, result: dict, pop_dir: Path) -> None:
+    """Per-population: how Sigma(|Z|) changes under linear/quadratic/tanh sigma_Z,
+    shown across several R bins. Saved as sigma_Z_model_comparison.png."""
+    prof = result.get("profile", pd.DataFrame())
+    pp = result.get("pp", None)
+    if prof is None or prof.empty or pp is None:
+        return
+    mfits = sigmaz_model_fits(prof, pp)
+    if not mfits:
+        return
+    zmax = float(pp["zmax"])
+    z = np.linspace(0.02, zmax, 220)
+    rng = np.random.default_rng(11)
+    r_targets = [4.0, 6.0, 8.0, 10.0, 12.0]
+    fig, axes = plt.subplots(1, len(r_targets), figsize=(3.5 * len(r_targets), 4.3), squeeze=False, sharex=True)
+    for ax, rt in zip(axes[0], r_targets):
+        r_used = rt
+        for model in SIGMAZ_MODELS:
+            if model not in mfits:
+                continue
+            ls, c = SIGMAZ_FX_STYLE[model]
+            r_used, med, lo, hi = _sigma_band(mfits[model], pp, rt, z, rng=rng)
+            ax.fill_between(z, lo, hi, color=c, alpha=0.18)
+            ax.plot(z, med, ls=ls, color=c, lw=2.0, label=model)
+        ax.plot(z, sdc.shm_sigma(r_used, z), color="firebrick", lw=1.4, label="SHM")
+        ax.set_title(rf"$R\simeq{r_used:.1f}$ kpc", fontsize=9)
+        ax.set_xlabel(r"$|Z|$ [kpc]")
+        ax.set_xlim(0, zmax)
+        ax.set_ylim(bottom=0)
+        ax.tick_params(direction="in", top=True, right=True, labelsize=8)
+    axes[0][0].set_ylabel(r"$\Sigma(R,|Z|)$ [$M_\odot\,\mathrm{pc}^{-2}$]")
+    axes[0][0].legend(frameon=False, fontsize=7.5)
+    fig.suptitle(rf"{label.capitalize()}: $\Sigma(|Z|)$ under linear / quadratic / tanh $\sigma_Z$ assumptions", y=1.0, fontsize=11)
+    fig.tight_layout()
+    fig.savefig(pop_dir / "sigma_Z_model_comparison.png", dpi=170, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_fig6_strict_nearest(results: dict[str, dict[str, object]], outd: Path) -> None:
-    fig, ax = plt.subplots(figsize=(9, 6))
-    styles = {
-        "thin": dict(color="#2166ac", ls="-", label="strict thin"),
-        "thick": dict(color="#b2182b", ls="--", label="strict thick"),
-        "halo": dict(color="#238b45", ls="-.", label="strict halo"),
-    }
-    plotted = False
-    nearest_rs = []
-    for label, style in styles.items():
-        if label not in results:
-            continue
+    """Fig. 6: how Sigma(|Z|) at the solar radius changes under the three Cheng
+    sigma_Z(|Z|) assumptions (linear / quadratic / tanh), one panel per population."""
+    labels = ordered_population_labels(results)
+    if not labels:
+        write_status_figure(outd, "fig6_solar_sigma.png", "Figure 6 Not Computable",
+                            ["No population surface-density results were produced."])
+        return
+    fig, axes = plt.subplots(1, len(labels), figsize=(5.8 * len(labels), 5.2), squeeze=False)
+    for ax, label in zip(axes[0], labels):
         result = results.get(label, {})
+        prof = result.get("profile", pd.DataFrame())
+        pp = result.get("pp", None)
         surface = result.get("surface", pd.DataFrame())
-        if surface.empty:
+        if prof is None or prof.empty or pp is None:
+            ax.text(0.5, 0.5, "no profile/pp", transform=ax.transAxes, ha="center", va="center")
+            ax.set_title(label.capitalize())
             continue
-        rvals = np.array(sorted(surface["R_mid"].dropna().unique()), dtype=float)
-        if rvals.size == 0:
-            continue
-        r_use = float(rvals[np.argmin(np.abs(rvals - PAPER_R0_KPC))])
-        nearest_rs.append(r_use)
-        sub = surface[
-            np.isclose(surface["R_mid"], r_use)
-            & np.isfinite(surface["Sigma_median_Msun_pc2"])
-            & np.isfinite(surface["Sigma_p16_Msun_pc2"])
-            & np.isfinite(surface["Sigma_p84_Msun_pc2"])
-        ].sort_values("Z_abs")
-        if sub.empty:
-            continue
-        ax.plot(sub["Z_abs"], sub["Sigma_median_Msun_pc2"], color=style["color"], ls=style["ls"], lw=2.4, label=f"{style['label']} R={r_use:.1f}")
-        ax.fill_between(sub["Z_abs"], sub["Sigma_p16_Msun_pc2"], sub["Sigma_p84_Msun_pc2"], color=style["color"], alpha=0.16)
-        plotted = True
-    zr = np.linspace(0.01, 4.5, 300)
-    r_ref = float(np.nanmedian(nearest_rs)) if nearest_rs else PAPER_R0_KPC
-    ax.plot(zr, sdc.shm_sigma(r_ref, zr), color="firebrick", lw=2.0, label=f"SHM R={r_ref:.1f}")
-    ax.set_xlabel(r"$|Z|$ [kpc]", fontsize=12)
-    ax.set_ylabel(r"$\Sigma(R,|Z|)$ [$M_\odot\,\mathrm{pc}^{-2}$]", fontsize=12)
-    ax.set_title("Figure 6-style strict nearest available R bin")
-    ax.set_xlim(0, 4.5)
-    ax.set_ylim(bottom=0)
-    if not plotted:
-        ax.text(0.5, 0.5, "no accepted non-negative strict Sigma(|Z|) rows", transform=ax.transAxes, ha="center", va="center")
-    ax.tick_params(direction="in", top=True, right=True)
-    secax = ax.secondary_yaxis("right", functions=(sdc.s2k, sdc.k2s))
-    secax.set_ylabel(r"$|K_Z|$ [km$^2$ s$^{-2}$ kpc$^{-1}$]", fontsize=11)
-    ax.legend(frameon=False, fontsize=10)
-    ax.grid(alpha=0.2)
+        zmax = float(pp["zmax"])
+        z = np.linspace(0.02, zmax, 240)
+        rng = np.random.default_rng(13)
+        mfits = sigmaz_model_fits(prof, pp)
+        r_used = PAPER_R0_KPC
+        for model in SIGMAZ_MODELS:
+            if model not in mfits:
+                continue
+            ls, c = SIGMAZ_FX_STYLE[model]
+            r_used, med, lo, hi = _sigma_band(mfits[model], pp, PAPER_R0_KPC, z, rng=rng)
+            ax.fill_between(z, lo, hi, color=c, alpha=0.18)
+            ax.plot(z, med, ls=ls, color=c, lw=2.3, label=f"{model} (16-84% band)")
+        ax.plot(z, sdc.shm_sigma(r_used, z), color="firebrick", lw=1.7, label="SHM")
+        ax.set_title(rf"{label.capitalize()} disc, $R={r_used:.1f}$ kpc")
+        ax.set_xlabel(r"$|Z|$ [kpc]")
+        ax.set_xlim(0, zmax)
+        ax.set_ylim(bottom=0)
+        ax.tick_params(direction="in", top=True, right=True)
+        ax.secondary_yaxis("right", functions=(sdc.s2k, sdc.k2s)).set_ylabel(r"$|K_Z|$")
+        ax.legend(frameon=False, fontsize=8)
+    axes[0][0].set_ylabel(r"$\Sigma(R,|Z|)$ [$M_\odot\,\mathrm{pc}^{-2}$]")
+    fig.suptitle(r"Effect of the three $\sigma_Z(|Z|)$ assumptions on $\Sigma(|Z|)$ at the solar radius (with MC error bands)", y=1.0, fontsize=12)
     fig.tight_layout()
     fig.savefig(outd / "fig6_solar_sigma.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_fig6_combined(results: dict[str, dict[str, object]], outd: Path) -> None:
+    """Fig. 6.1: all populations x all three sigma_Z models overplotted on a
+    single Sigma(|Z|) axis at the solar radius, each with its MC error band.
+    Colour = population, line style = sigma_Z model."""
+    labels = ordered_population_labels(results)
+    if not labels:
+        write_status_figure(outd, "fig6p1_solar_sigma_combined.png", "Figure 6.1 Not Computable",
+                            ["No population surface-density results were produced."])
+        return
+    fig, ax = plt.subplots(figsize=(10.0, 7.0))
+    rng = np.random.default_rng(17)
+    z_top = 0.0
+    r_ref = PAPER_R0_KPC
+    for label in labels:
+        result = results.get(label, {})
+        prof = result.get("profile", pd.DataFrame())
+        pp = result.get("pp", None)
+        if prof is None or prof.empty or pp is None:
+            continue
+        pop_color = SIGMAZ_POP_COLOR.get(label, "0.3")
+        zmax = float(pp["zmax"])
+        z = np.linspace(0.02, zmax, 240)
+        z_top = max(z_top, zmax)
+        mfits = sigmaz_model_fits(prof, pp)
+        for model in SIGMAZ_MODELS:
+            if model not in mfits:
+                continue
+            ls, _c = SIGMAZ_FX_STYLE[model]
+            r_ref, med, lo, hi = _sigma_band(mfits[model], pp, PAPER_R0_KPC, z, rng=rng)
+            ax.fill_between(z, lo, hi, color=pop_color, alpha=0.08)
+            ax.plot(z, med, ls=ls, color=pop_color, lw=2.0)
+    zr = np.linspace(0.02, max(z_top, 1.0), 300)
+    ax.plot(zr, sdc.shm_sigma(r_ref, zr), color="black", lw=2.2, label="SHM")
+    pop_handles = [Line2D([0], [0], color=SIGMAZ_POP_COLOR[l], lw=2.4, label=l) for l in labels]
+    model_handles = [Line2D([0], [0], color="0.25", ls=SIGMAZ_FX_STYLE[m][0], lw=2.0, label=m) for m in SIGMAZ_MODELS]
+    leg1 = ax.legend(handles=pop_handles, frameon=False, fontsize=10, loc="upper left", title="population (colour)")
+    ax.add_artist(leg1)
+    ax.legend(handles=model_handles + [Line2D([0], [0], color="black", lw=2.2, label="SHM")],
+              frameon=False, fontsize=10, loc="lower right", title=r"$\sigma_Z$ model (line style)")
+    ax.set_xlabel(r"$|Z|$ [kpc]", fontsize=12)
+    ax.set_ylabel(r"$\Sigma(R_\odot,|Z|)$ [$M_\odot\,\mathrm{pc}^{-2}$]", fontsize=12)
+    ax.set_title(r"Fig. 6.1: $\Sigma(|Z|)$ at the Sun, all populations $\times$ three $\sigma_Z$ models (MC bands)")
+    ax.set_xlim(0, z_top)
+    ax.set_ylim(bottom=0)
+    ax.tick_params(direction="in", top=True, right=True)
+    ax.secondary_yaxis("right", functions=(sdc.s2k, sdc.k2s)).set_ylabel(r"$|K_Z|$ [km$^2$ s$^{-2}$ kpc$^{-1}$]")
+    ax.grid(alpha=0.15)
+    fig.tight_layout()
+    fig.savefig(outd / "fig6p1_solar_sigma_combined.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -2362,6 +2509,7 @@ def write_population_outputs(data: dict[str, np.ndarray], results: dict[str, dic
             (pd.concat(fig8_rows, ignore_index=True) if fig8_rows else pd.DataFrame()).to_csv(pop_dir / "sigma_R_fig8_rows.csv", index=False)
         plot_population_sigma_r(label, result, pop_dir)
         plot_population_sigma_z(label, result, pop_dir)
+        plot_population_sigmaz_model_effect(label, result, pop_dir)
 
 
 def range_token(lo: float, hi: float) -> str:
@@ -2803,6 +2951,127 @@ def write_original_panel_outputs(
     return manifest_df
 
 
+# --- Velocity-dispersion figures (Cheng Fig. 2-4 style) ---------------------
+# Three populations and the three Cheng sigma_Z(|Z|) models (paper App. A & B):
+#   linear     : sigma_Z^2 = a|Z| + b           (Sec 4.1 / App A, primary)
+#   quadratic  : sigma_Z^2 = k Z^2 + sigma0^2    (App B, continuous at Z=0)
+#   tanh       : sigma_Z   = kz*tanh(|Z|/L) + s0 (App B, continuous + linear at large Z)
+VDISP_RANGES = [
+    (3, 6, "fig2_velocity_dispersion_R3_6.png"),
+    (6, 9, "fig3_velocity_dispersion_R6_9.png"),
+    (9, 12, "fig4_velocity_dispersion_R9_12.png"),
+]
+VDISP_POPS = [("thin", "#2166ac"), ("thick", "#b2182b"), ("halo", "#238b45")]
+SIGMAZ_MODEL_LS = {"linear": "-", "quadratic": "--", "tanh": ":"}
+
+
+def fit_sigmaz_models(z_abs: np.ndarray, sZ: np.ndarray, sZe: np.ndarray) -> dict[str, tuple]:
+    """Fit the three Cheng sigma_Z(|Z|) models. Returns {name: (predict_fn, rms_kms)}."""
+    z = np.abs(np.asarray(z_abs, dtype=float))
+    s = np.asarray(sZ, dtype=float)
+    e = np.asarray(sZe, dtype=float)
+    good = np.isfinite(z) & np.isfinite(s) & (s > 0)
+    z, s = z[good], s[good]
+    e = e[good]
+    if z.size < 5:
+        return {}
+    s2 = s ** 2
+    # weight on sigma^2: d(sigma^2) ~ 2 sigma d(sigma)
+    w = np.where(np.isfinite(e) & (e > 0), 1.0 / np.maximum(2.0 * s * e, 1e-6), 1.0)
+    out: dict[str, tuple] = {}
+
+    def rms(fn):
+        return float(np.sqrt(np.mean((fn(z) - s) ** 2)))
+
+    try:  # linear: sigma^2 = a|Z| + b
+        a, b = np.polyfit(z, s2, 1, w=w)
+        fn = lambda Z, a=a, b=b: np.sqrt(np.clip(a * np.abs(Z) + b, 0.0, None))
+        out["linear"] = (fn, rms(fn))
+    except Exception:
+        pass
+    try:  # quadratic: sigma^2 = k Z^2 + sigma0^2
+        k, c = np.polyfit(z ** 2, s2, 1, w=w)
+        fn = lambda Z, k=k, c=c: np.sqrt(np.clip(k * np.asarray(Z) ** 2 + c, 0.0, None))
+        out["quadratic"] = (fn, rms(fn))
+    except Exception:
+        pass
+    try:  # tanh: sigma = kz tanh(|Z|/L) + s0  (L bounded so it can't collapse to a step)
+        sigma = e if np.all(np.isfinite(e) & (e > 0)) else None
+        p0 = [max(float(s.max() - s.min()), 1.0), 1.0, max(float(s.min()), 1.0)]
+        popt, _ = curve_fit(
+            lambda Z, kz, L, s0: kz * np.tanh(np.abs(Z) / L) + s0,
+            z, s, p0=p0, sigma=sigma, absolute_sigma=False, maxfev=20000,
+            bounds=([0.0, 0.3, 0.0], [400.0, 25.0, 300.0]),
+        )
+        fn = lambda Z, p=popt: p[0] * np.tanh(np.abs(np.asarray(Z)) / p[1]) + p[2]
+        out["tanh"] = (fn, rms(fn))
+    except Exception:
+        pass
+    return out
+
+
+def plot_velocity_dispersion_models(results: dict[str, dict[str, object]], outd: Path) -> None:
+    """Fig. 2-4: thin/thick/halo sigma_R, sigma_phi, sigma_Z vs Z in 1-kpc R columns.
+
+    Fixes the empty-column bug (1-kpc columns are built from the actual fine R
+    bins, not by matching integer bin edges), adds the halo series, and overlays
+    the three Cheng sigma_Z(|Z|) models on the sigma_Z row with their RMS.
+    """
+    profs = {lab: results.get(lab, {}).get("profile", pd.DataFrame()) for lab, _ in VDISP_POPS}
+    rows = [("sR", "sRe", r"$\sigma_R$"), ("sp", "spe", r"$\sigma_\phi$"), ("sZ", "sZe", r"$\sigma_Z$")]
+    for r0, r1, fname in VDISP_RANGES:
+        colbins = list(range(r0, r1))
+        fig, axes = plt.subplots(3, len(colbins), figsize=(4.3 * len(colbins), 10.5), squeeze=False, sharex=False)
+        for jc, c0 in enumerate(colbins):
+            for i, (ycol, ecol, ylabel) in enumerate(rows):
+                ax = axes[i][jc]
+                rms_lines = []
+                for lab, color in VDISP_POPS:
+                    pf = profs[lab]
+                    if pf.empty:
+                        continue
+                    sub = pf[(pf["rm"] >= c0) & (pf["rm"] < c0 + 1)]
+                    if sub.empty:
+                        continue
+                    ax.errorbar(
+                        sub["zm"], sub[ycol], yerr=sub[ecol], fmt="o", ms=2.6, lw=0.6,
+                        capsize=1.2, color=color, alpha=0.7,
+                        label=lab if (i == 0 and jc == 0) else None,
+                    )
+                    if ycol == "sZ":
+                        models = fit_sigmaz_models(sub["zm"].to_numpy(), sub["sZ"].to_numpy(), sub["sZe"].to_numpy())
+                        if models:
+                            zg = np.linspace(float(sub["zm"].min()), float(sub["zm"].max()), 240)
+                            for mname, (fn, _rms) in models.items():
+                                ax.plot(zg, fn(zg), color=color, ls=SIGMAZ_MODEL_LS[mname], lw=1.4, alpha=0.95, zorder=4)
+                            rms_lines.append(
+                                f"{lab}: " + " ".join(f"{m[:3]}={v:.0f}" for m, (_f, v) in models.items())
+                            )
+                if ycol == "sZ" and rms_lines:
+                    ax.text(
+                        0.03, 0.97, "RMS [km/s]\n" + "\n".join(rms_lines), transform=ax.transAxes,
+                        fontsize=6.5, va="top", ha="left",
+                        bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.75),
+                    )
+                ax.axvline(0, color="0.75", lw=0.8)
+                ax.set_title(f"R={c0}-{c0 + 1} kpc", fontsize=9)
+                ax.tick_params(direction="in", top=True, right=True, labelsize=8)
+                if jc == 0:
+                    ax.set_ylabel(ylabel)
+                if i == 2:
+                    ax.set_xlabel(r"$Z$ [kpc]")
+        # legends: populations (top-left), sigma_Z models (sigma_Z first column)
+        pop_handles = [Line2D([0], [0], color=c, marker="o", ls="", label=lab) for lab, c in VDISP_POPS]
+        axes[0][0].legend(handles=pop_handles, frameon=False, fontsize=8, loc="upper left")
+        model_handles = [Line2D([0], [0], color="0.3", ls=ls, lw=1.4, label=m)
+                         for m, ls in SIGMAZ_MODEL_LS.items()]
+        axes[2][0].legend(handles=model_handles, frameon=False, fontsize=7.5, loc="lower right", title=r"$\sigma_Z$ models")
+        fig.suptitle(f"Velocity dispersions with three $\\sigma_Z(|Z|)$ models, R={r0}-{r1} kpc", y=0.995, fontsize=11)
+        fig.tight_layout(rect=(0, 0, 1, 0.98))
+        fig.savefig(outd / fname, dpi=160, bbox_inches="tight")
+        plt.close(fig)
+
+
 def generate_paper_figure_set(data: dict[str, np.ndarray], strict_l2, results, outd: Path, rng) -> None:
     manifest = []
 
@@ -2817,11 +3086,12 @@ def generate_paper_figure_set(data: dict[str, np.ndarray], strict_l2, results, o
     fn = results["thin"].get("fits", pd.DataFrame())
     fk = results["thick"].get("fits", pd.DataFrame())
 
-    if not pn.empty or not pk.empty:
-        sdc.plot_velocity_figures(pn, pk, outd)
-        add("Figure 2", "fig2_velocity_dispersion_R3_6.png", "ok", "Strict L1/L2 velocity-dispersion profiles; empty panels mean no direct-L2 data.")
-        add("Figure 3", "fig3_velocity_dispersion_R6_9.png", "ok", "Strict L1/L2 velocity-dispersion profiles; the R=7-9 kpc direct-L2 hole is left empty.")
-        add("Figure 4", "fig4_velocity_dispersion_R9_12.png", "ok", "Strict L1/L2 velocity-dispersion profiles.")
+    ph = results.get("halo", {}).get("profile", pd.DataFrame())
+    if not pn.empty or not pk.empty or not ph.empty:
+        plot_velocity_dispersion_models(results, outd)
+        add("Figure 2", "fig2_velocity_dispersion_R3_6.png", "ok", "Thin/thick/halo sigma_R, sigma_phi, sigma_Z vs Z in 1-kpc R columns; sigma_Z overlaid with linear, quadratic and tanh models (RMS annotated).")
+        add("Figure 3", "fig3_velocity_dispersion_R6_9.png", "ok", "As Figure 2 for R=6-9 kpc.")
+        add("Figure 4", "fig4_velocity_dispersion_R9_12.png", "ok", "As Figure 2 for R=9-12 kpc.")
         plot_fig5_hsigma_results(results, outd)
         add("Figure 5", "fig5_hsigma_fit.png", "ok", "Adopted h_sigma fits; direct fixed-Z points are used when sufficient, otherwise paper odd-linear sigma_RZ fixed-Z points are used.")
     else:
@@ -2835,7 +3105,9 @@ def generate_paper_figure_set(data: dict[str, np.ndarray], strict_l2, results, o
             add(fig, fname, "blocked", "No strict velocity-dispersion profile rows were produced.")
 
     plot_fig6_strict_nearest(results, outd)
-    add("Figure 6", "fig6_solar_sigma.png", "ok", "Strict accepted non-negative Sigma(|Z|) at the nearest available strict R bin to the solar radius.")
+    add("Figure 6", "fig6_solar_sigma.png", "ok", "Sigma(|Z|) at the solar radius under the linear/quadratic/tanh sigma_Z assumptions (one panel per population, MC error bands).")
+    plot_fig6_combined(results, outd)
+    add("Figure 6.1", "fig6p1_solar_sigma_combined.png", "ok", "All populations x three sigma_Z models overplotted on a single Sigma(|Z|) axis at the solar radius, with MC error bands.")
 
     plot_fig7_strict_surface_grid(results, outd)
     add("Figure 7", "fig7_sigma_grid.png", "ok", "Accepted non-negative strict surface-density curves with SHM and right-axis |K_Z|.")
